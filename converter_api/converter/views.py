@@ -1,64 +1,60 @@
-import io
-import zipfile
-from django.http import HttpResponse
+import os
+import tempfile
+from django.http import FileResponse
+from django.shortcuts import render
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 
-from PIL import Image
-import fitz  # PyMuPDF
+from .serializers import ConvertSerializer
+from .forms import UploadForm
+from .utils import pdf_to_images_and_html
 
-from .serializers import FileConvertSerializer
 
-
+# ===============================
+# 1. APIView для DRF
+# ===============================
 class ImageConvertAPIView(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
-    def post(self, request):
-        serializer = FileConvertSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    def post(self, request, *args, **kwargs):
+        serializer = ConvertSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        files = serializer.validated_data["files"]
-        target_format = serializer.validated_data["format"]
+        pdf_file = serializer.validated_data['files']
+        fmt = serializer.validated_data['format']
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-            image_paths: list[str] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "converted.zip")
+            pdf_to_images_and_html(pdf_file, tmpdir, fmt, zip_path)
 
-            for idx, file in enumerate(files, start=1):
-                filename = file.name.lower()
+            return FileResponse(
+                open(zip_path, "rb"),
+                as_attachment=True,
+                filename="converted.zip"
+            )
 
-                if filename.endswith(".pdf"):
-                    pdf_doc = fitz.open(stream=file.read(), filetype="pdf")
-                    for page_num, page in enumerate(pdf_doc, start=1):
-                        pix = page.get_pixmap()
-                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-                        img_name = f"images/pdf_{idx}_page{page_num}.{target_format}"
-                        image_paths.append(img_name)
+# ===============================
+# 2. HTML-форма для сайта
+# ===============================
+def upload_view(request):
+    if request.method == "POST":
+        form = UploadForm(request.POST, request.FILES)
+        if form.is_valid():
+            pdf_file = request.FILES['file']
+            fmt = form.cleaned_data['format']
 
-                        img_bytes = io.BytesIO()
-                        img.save(img_bytes, format=target_format.upper())
-                        zip_file.writestr(img_name, img_bytes.getvalue())
-                else:
-                    img = Image.open(file).convert("RGB")
-                    img_name = f"images/img_{idx}.{target_format}"
-                    image_paths.append(img_name)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, "converted.zip")
+                pdf_to_images_and_html(pdf_file, tmpdir, fmt, zip_path)
 
-                    img_bytes = io.BytesIO()
-                    img.save(img_bytes, format=target_format.upper())
-                    zip_file.writestr(img_name, img_bytes.getvalue())
+                return FileResponse(
+                    open(zip_path, "rb"),
+                    as_attachment=True,
+                    filename="converted.zip"
+                )
+    else:
+        form = UploadForm()
 
-            # создаём index.html
-            html_content = "<html><body><h1>Converted Files</h1>"
-            for path in image_paths:
-                html_content += f'<div><img src="{path}" style="max-width:400px;"></div>'
-            html_content += "</body></html>"
-
-            zip_file.writestr("index.html", html_content)
-
-        response = HttpResponse(zip_buffer.getvalue(), content_type="application/zip")
-        response["Content-Disposition"] = 'attachment; filename="converted.zip"'
-        return response
+    return render(request, "upload.html", {"form": form})
